@@ -1,0 +1,102 @@
+############################
+# Node.js
+############################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+
+############################
+# Environment Variables
+############################
+.env
+.env.*
+!.env.example
+
+############################
+# Logs
+############################
+logs/
+*.log
+
+############################
+# Runtime Data
+############################
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+############################
+# Coverage / Testing
+############################
+coverage/
+.nyc_output/
+
+############################
+# Build Output
+############################
+dist/
+build/
+tmp/
+temp/
+
+############################
+# Uploads / Media
+############################
+uploads/
+media/
+*.mp4
+*.mov
+*.zip
+
+############################
+# MongoDB / Redis Local Data
+############################
+data/
+dump.rdb
+*.bson
+
+############################
+# Docker
+############################
+docker-data/
+docker-volumes/
+*.tar
+
+############################
+# Kubernetes
+############################
+*.kubeconfig
+kubeconfig
+.secrets.yaml
+secret.yaml
+
+############################
+# Prometheus / Grafana
+############################
+prometheus_data/
+grafana_data/
+
+############################
+# IDE / Editor
+############################
+.vscode/
+.idea/
+*.swp
+*.swo
+
+############################
+# OS Files
+############################
+.DS_Store
+Thumbs.db
+
+############################
+# Misc
+############################
+*.local
+*.cache
