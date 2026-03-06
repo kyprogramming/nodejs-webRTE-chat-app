@@ -59,20 +59,26 @@ const apiLimiter = rateLimit({
     message: { error: "Too many requests, please try again later." },
 });
 app.use("/upload", apiLimiter);
-
 app.use(express.json({ limit: "1mb" }));
+
+// ── Static files ──────────────────────────────────────────────────────────────
 app.use(
     express.static(PUBLIC_DIR, {
         maxAge: IS_PROD ? "7d" : 0,
         etag: true,
+        // Never cache index.html — always serve fresh so ICE meta stays current
+        setHeaders(res, filePath) {
+            if (filePath.endsWith("index.html")) {
+                res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+            }
+        },
     })
 );
 
-// Multer — disk storage with sanitised filename
+// ── Multer setup ──────────────────────────────────────────────────────────────
 const storage = multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
     filename: (_req, file, cb) => {
-        // strip path traversal chars, keep extension
         const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
         cb(null, `${uuidv4()}-${safe}`);
     },
@@ -100,13 +106,14 @@ const ALLOWED_MIME = new Set([
 ]);
 const upload = multer({
     storage,
-    limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+    limits: { fileSize: 50 * 1024 * 1024 },
     fileFilter: (_req, file, cb) => {
         if (ALLOWED_MIME.has(file.mimetype)) cb(null, true);
         else cb(new Error(`File type "${file.mimetype}" is not allowed`));
     },
 });
 
+// ── Upload route ──────────────────────────────────────────────────────────────
 app.post("/upload", upload.single("file"), (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file received" });
     res.json({
@@ -117,41 +124,60 @@ app.post("/upload", upload.single("file"), (req, res) => {
     });
 });
 
-// Multer error handler
-app.use((err, _req, res, _next) => {
-    if (err?.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "File too large (max 50 MB)" });
-    if (err?.message) return res.status(400).json({ error: err.message });
-    res.status(500).json({ error: "Internal server error" });
-});
-
 // ── TURN / ICE config injected into HTML ─────────────────────────────────────
-// Set TURN_URL, TURN_USERNAME, TURN_CREDENTIAL as env vars on Render
 function buildIceMeta() {
     const { TURN_URL, TURN_USERNAME, TURN_CREDENTIAL } = process.env;
     if (!TURN_URL) return "";
     const servers = [{ urls: TURN_URL, username: TURN_USERNAME ?? "", credential: TURN_CREDENTIAL ?? "" }];
-    const encoded = encodeURIComponent(JSON.stringify(servers));
-    return `<meta name="ice-config" content="${encoded}">`;
+    return `<meta name="ice-config" content="${encodeURIComponent(JSON.stringify(servers))}">`;
 }
 
-// SPA catch-all — inject ICE meta into HTML
-// app.use() avoids path-to-regexp "*" breaking change in newer Express 4.x
-app.use((_req, res, next) => {
-    if (_req.method !== "GET") return next();
-    const indexPath = path.join(PUBLIC_DIR, "index.html");
-    fs.readFile(indexPath, "utf8", (err, html) => {
-        if (err) return res.status(500).send("Server error");
+// Cache the patched HTML in production so we don't hit disk on every request
+let _cachedHtml = null;
+function getIndexHtml(cb) {
+    if (IS_PROD && _cachedHtml) return cb(null, _cachedHtml);
+    fs.readFile(path.join(PUBLIC_DIR, "index.html"), "utf8", (err, raw) => {
+        if (err) return cb(err);
         const iceMeta = buildIceMeta();
-        const patched = iceMeta
-            ? html.replace(
+        const html = iceMeta
+            ? raw.replace(
                   "</head>",
                   `  ${iceMeta}
 </head>`
               )
-            : html;
-        res.setHeader("Content-Type", "text/html; charset=utf-8");
-        res.send(patched);
+            : raw;
+        if (IS_PROD) _cachedHtml = html;
+        cb(null, html);
     });
+}
+
+// ── SPA catch-all ─────────────────────────────────────────────────────────────
+// Handles every GET that wasn't matched by static files or /upload
+// Uses app.use to avoid the path-to-regexp "*" breakage in Express 4.19+
+app.use((req, res, next) => {
+    // Only handle GET/HEAD — let Express deal with 405 for other methods on unknown routes
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        return res.status(405).json({ error: "Method not allowed" });
+    }
+    getIndexHtml((err, html) => {
+        if (err) {
+            console.error("Failed to read index.html:", err);
+            return res.status(500).send("Internal server error");
+        }
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.send(html);
+    });
+});
+
+// ── Global error handler (must be last, after all routes) ─────────────────────
+// Catches multer errors, JSON parse errors, and anything else thrown
+app.use((err, req, res, _next) => {
+    console.error(`[ERROR] ${req.method} ${req.path}:`, err.message);
+    if (err?.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "File too large (max 50 MB)" });
+    if (err?.type === "entity.parse.failed") return res.status(400).json({ error: "Invalid JSON" });
+    if (err?.message) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: "Internal server error" });
 });
 
 // ── WebSocket Server ──────────────────────────────────────────────────────────
