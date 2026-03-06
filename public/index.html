@@ -420,6 +420,11 @@
             background: #000;
         }
 
+        /* Mirror local camera so it feels natural (selfie view) — remote videos are NOT mirrored */
+        #tile-local video {
+            transform: scaleX(-1);
+        }
+
         .v-tile .tname {
             position: absolute;
             bottom: 8px;
