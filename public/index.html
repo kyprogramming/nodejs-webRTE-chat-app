@@ -1206,7 +1206,22 @@
         let pendingOffer = null, unread = 0;
         const peers = new Map();
         const roomUsers = new Map();
-        const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }] };
+        // ICE config — STUN always included; TURN injected via <meta> if configured on server
+        function getIceConfig() {
+            const meta = document.querySelector('meta[name="ice-config"]');
+            const base = [
+                { urls: "stun:stun.l.google.com:19302" },
+                { urls: "stun:stun1.l.google.com:19302" },
+            ];
+            try {
+                if (meta?.content) {
+                    const extra = JSON.parse(decodeURIComponent(meta.content));
+                    return { iceServers: [...base, ...extra] };
+                }
+            } catch { /* ignore */ }
+            return { iceServers: base };
+        }
+        const ICE = getIceConfig();
 
         // Toast
         let tt;
@@ -1233,13 +1248,24 @@
         ["people", "chat"].forEach(w => { $(`#overlay-${w}`).addEventListener("click", () => closeDrawer(w)); $(`#close-${w}`).addEventListener("click", () => closeDrawer(w)); });
 
         // WebSocket
+        let _wsDelay = 1000;
         function connectWS() {
             const proto = location.protocol === "https:" ? "wss" : "ws";
             ws = new WebSocket(`${proto}://${location.host}`);
-            ws.onopen = () => { $("#ws-dot").classList.add("connected"); };
-            ws.onclose = () => { $("#ws-dot").classList.remove("connected"); toast("⚠️ Reconnecting…"); setTimeout(connectWS, 2000); };
+            ws.onopen = () => {
+                $("#ws-dot").classList.add("connected");
+                _wsDelay = 1000; // reset backoff on success
+            };
+            ws.onclose = () => {
+                $("#ws-dot").classList.remove("connected");
+                toast(`⚠️ Reconnecting in ${_wsDelay / 1000}s…`);
+                setTimeout(connectWS, _wsDelay);
+                _wsDelay = Math.min(_wsDelay * 2, 30000); // cap at 30s
+            };
             ws.onerror = e => console.error("WS", e);
-            ws.onmessage = ev => handleMsg(JSON.parse(ev.data));
+            ws.onmessage = ev => {
+                try { handleMsg(JSON.parse(ev.data)); } catch (e) { console.error("WS msg parse error", e); }
+            };
         }
         function wsSend(p) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(p)); }
 

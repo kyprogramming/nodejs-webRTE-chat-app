@@ -6,28 +6,109 @@ import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import helmet from "helmet";
+import compression from "compression";
+import rateLimit from "express-rate-limit";
 
+// ── ESM __dirname ─────────────────────────────────────────────────────────────
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ── Express setup ────────────────────────────────────────────────────────────
+const IS_PROD = process.env.NODE_ENV === "production";
+const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const PUBLIC_DIR = path.join(__dirname, "public");
+const UPLOADS_DIR = path.join(PUBLIC_DIR, "uploads");
+
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
 const server = createServer(app);
 
-const uploadsDir = path.join(__dirname, "public", "uploads");
-fs.mkdirSync(uploadsDir, { recursive: true });
+// Security headers (Render serves HTTPS in front, so we relax upgrade-insecure)
+app.use(
+    helmet({
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: ["'self'", "'unsafe-inline'"], // inline <script type=module>
+                styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+                fontSrc: ["'self'", "https://fonts.gstatic.com"],
+                mediaSrc: ["'self'", "blob:"],
+                connectSrc: ["'self'", "wss:", "ws:", "https://stun.l.google.com"],
+                imgSrc: ["'self'", "data:", "blob:"],
+                upgradeInsecureRequests: IS_PROD ? [] : null,
+            },
+        },
+        crossOriginEmbedderPolicy: false, // required for getUserMedia on some browsers
+    })
+);
 
-const storage = multer.diskStorage({
-    destination: (_req, _file, cb) => cb(null, uploadsDir),
-    filename: (_req, file, cb) => cb(null, `${uuidv4()}-${file.originalname}`),
+// Gzip all text responses
+app.use(compression());
+
+// Trust Render's proxy so req.ip / rate limiting works correctly
+app.set("trust proxy", 1);
+
+// Rate limit REST endpoints
+const apiLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 min
+    max: 100,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later." },
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+app.use("/upload", apiLimiter);
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.json({ limit: "1mb" }));
+app.use(
+    express.static(PUBLIC_DIR, {
+        maxAge: IS_PROD ? "7d" : 0,
+        etag: true,
+    })
+);
+
+// Multer — disk storage with sanitised filename
+const storage = multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+    filename: (_req, file, cb) => {
+        // strip path traversal chars, keep extension
+        const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
+        cb(null, `${uuidv4()}-${safe}`);
+    },
+});
+const ALLOWED_MIME = new Set([
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/svg+xml",
+    "video/mp4",
+    "video/webm",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "application/pdf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/plain",
+    "text/csv",
+]);
+const upload = multer({
+    storage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
+    fileFilter: (_req, file, cb) => {
+        if (ALLOWED_MIME.has(file.mimetype)) cb(null, true);
+        else cb(new Error(`File type "${file.mimetype}" is not allowed`));
+    },
+});
 
 app.post("/upload", upload.single("file"), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+    if (!req.file) return res.status(400).json({ error: "No file received" });
     res.json({
         fileName: req.file.originalname,
         filePath: `/uploads/${req.file.filename}`,
@@ -36,32 +117,73 @@ app.post("/upload", upload.single("file"), (req, res) => {
     });
 });
 
-// ── Native WebSocket Server ──────────────────────────────────────────────────
-const wss = new WebSocketServer({ server });
+// Multer error handler
+app.use((err, _req, res, _next) => {
+    if (err?.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "File too large (max 50 MB)" });
+    if (err?.message) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: "Internal server error" });
+});
 
-// State
-// clients: Map<socketId, { ws, username, roomId }>
+// ── TURN / ICE config injected into HTML ─────────────────────────────────────
+// Set TURN_URL, TURN_USERNAME, TURN_CREDENTIAL as env vars on Render
+function buildIceMeta() {
+    const { TURN_URL, TURN_USERNAME, TURN_CREDENTIAL } = process.env;
+    if (!TURN_URL) return "";
+    const servers = [{ urls: TURN_URL, username: TURN_USERNAME ?? "", credential: TURN_CREDENTIAL ?? "" }];
+    const encoded = encodeURIComponent(JSON.stringify(servers));
+    return `<meta name="ice-config" content="${encoded}">`;
+}
+
+// SPA catch-all — inject ICE meta into HTML
+// app.use() avoids path-to-regexp "*" breaking change in newer Express 4.x
+app.use((_req, res, next) => {
+    if (_req.method !== "GET") return next();
+    const indexPath = path.join(PUBLIC_DIR, "index.html");
+    fs.readFile(indexPath, "utf8", (err, html) => {
+        if (err) return res.status(500).send("Server error");
+        const iceMeta = buildIceMeta();
+        const patched = iceMeta
+            ? html.replace(
+                  "</head>",
+                  `  ${iceMeta}
+</head>`
+              )
+            : html;
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(patched);
+    });
+});
+
+// ── WebSocket Server ──────────────────────────────────────────────────────────
+const wss = new WebSocketServer({ server, maxPayload: 1 * 1024 * 1024 }); // 1 MB max frame
+
+// ── In-memory state ───────────────────────────────────────────────────────────
+// clients : Map<socketId, { ws, username, roomId, isAlive }>
+// rooms   : Map<roomId,   Set<socketId>>
 const clients = new Map();
-// rooms:   Map<roomId, Set<socketId>>
 const rooms = new Map();
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function send(ws, payload) {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(payload));
+// ── WS helpers ────────────────────────────────────────────────────────────────
+function safeSend(ws, payload) {
+    if (ws.readyState === ws.OPEN) {
+        try {
+            ws.send(JSON.stringify(payload));
+        } catch {
+            /* ignore */
+        }
+    }
 }
-
 function sendTo(socketId, payload) {
-    const client = clients.get(socketId);
-    if (client) send(client.ws, payload);
+    const c = clients.get(socketId);
+    if (c) safeSend(c.ws, payload);
 }
-
 function broadcast(roomId, payload, excludeId = null) {
-    const room = rooms.get(roomId) ?? new Set();
+    const room = rooms.get(roomId);
+    if (!room) return;
     for (const id of room) {
         if (id !== excludeId) sendTo(id, payload);
     }
 }
-
 function getRoomUsers(roomId) {
     const room = rooms.get(roomId) ?? new Set();
     return [...room]
@@ -71,16 +193,66 @@ function getRoomUsers(roomId) {
         })
         .filter(Boolean);
 }
+function removeClient(socketId) {
+    const client = clients.get(socketId);
+    if (!client) return;
+    const room = rooms.get(client.roomId);
+    room?.delete(socketId);
+    if (room?.size === 0) rooms.delete(client.roomId);
+    broadcast(client.roomId, { type: "user-left", socketId, username: client.username });
+    clients.delete(socketId);
+    console.log(`[-] ${client.username} disconnected (${socketId.slice(0, 8)})`);
+}
+
+// ── Heartbeat — ping every 30s, close dead connections ───────────────────────
+const PING_INTERVAL = 30_000;
+const pingTimer = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            ws.terminate();
+            return;
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, PING_INTERVAL);
+wss.on("close", () => clearInterval(pingTimer));
+
+// ── Per-client message rate limiter ──────────────────────────────────────────
+const MSG_WINDOW = 5_000; // 5 s
+const MSG_LIMIT = 30; // max messages per window
+const msgCounters = new Map(); // socketId → { count, resetAt }
+function isRateLimited(socketId) {
+    const now = Date.now();
+    let entry = msgCounters.get(socketId);
+    if (!entry || now > entry.resetAt) {
+        entry = { count: 0, resetAt: now + MSG_WINDOW };
+        msgCounters.set(socketId, entry);
+    }
+    entry.count++;
+    return entry.count > MSG_LIMIT;
+}
 
 // ── Connection handler ────────────────────────────────────────────────────────
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
     const socketId = uuidv4();
-    console.log(`✅ WS connected: ${socketId}`);
+    ws.isAlive = true;
+    ws.on("pong", () => {
+        ws.isAlive = true;
+    });
 
-    // Assign the id so the client knows who it is
-    send(ws, { type: "connected", socketId });
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0].trim() ?? req.socket.remoteAddress;
+    console.log(`[+] WS connected: ${socketId.slice(0, 8)} from ${ip}`);
+
+    safeSend(ws, { type: "connected", socketId });
 
     ws.on("message", (raw) => {
+        // Rate limit check
+        if (isRateLimited(socketId)) {
+            safeSend(ws, { type: "error", message: "Rate limit exceeded" });
+            return;
+        }
+
         let msg;
         try {
             msg = JSON.parse(raw);
@@ -90,114 +262,109 @@ wss.on("connection", (ws) => {
 
         const { type } = msg;
 
-        // ── join-room ────────────────────────────────────────────────────────────
+        // ── join-room ─────────────────────────────────────────────────────────
         if (type === "join-room") {
-            const { roomId, username } = msg;
-            clients.set(socketId, { ws, username, roomId });
+            const username =
+                String(msg.username ?? "")
+                    .slice(0, 30)
+                    .trim() || "Anonymous";
+            const roomId = String(msg.roomId ?? "")
+                .slice(0, 50)
+                .trim();
+            if (!roomId) return;
 
+            clients.set(socketId, { ws, username, roomId, isAlive: true });
             const room = rooms.get(roomId) ?? new Set();
             room.add(socketId);
             rooms.set(roomId, room);
 
-            // Tell joiner who is already there (everyone except themselves)
             const existing = getRoomUsers(roomId).filter((u) => u.socketId !== socketId);
-            send(ws, { type: "room-users", users: existing });
-
-            // Notify existing peers
+            safeSend(ws, { type: "room-users", users: existing });
             broadcast(roomId, { type: "user-joined", socketId, username }, socketId);
-            console.log(`👤 ${username} joined room "${roomId}"`);
+            console.log(`[R] ${username} → room "${roomId}" (${room.size} users)`);
             return;
         }
 
-        // ── WebRTC signalling ────────────────────────────────────────────────────
-        if (type === "offer") {
+        // ── WebRTC signalling (relay only — server never inspects SDP) ────────
+        const RELAY_TYPES = ["offer", "answer", "ice-candidate", "call-rejected", "call-ended"];
+        if (RELAY_TYPES.includes(type)) {
+            const to = String(msg.to ?? "");
+            if (!clients.has(to)) return; // target gone
             const client = clients.get(socketId);
-            sendTo(msg.to, {
-                type: "offer",
+            sendTo(to, {
+                type,
                 from: socketId,
                 username: client?.username,
-                offer: msg.offer,
-                callType: msg.callType,
+                ...(msg.offer && { offer: msg.offer, callType: msg.callType }),
+                ...(msg.answer && { answer: msg.answer }),
+                ...(msg.candidate && { candidate: msg.candidate }),
             });
             return;
         }
 
-        if (type === "answer") {
-            sendTo(msg.to, { type: "answer", from: socketId, answer: msg.answer });
-            return;
-        }
-
-        if (type === "ice-candidate") {
-            sendTo(msg.to, { type: "ice-candidate", from: socketId, candidate: msg.candidate });
-            return;
-        }
-
-        if (type === "call-rejected") {
-            sendTo(msg.to, { type: "call-rejected", from: socketId });
-            return;
-        }
-
-        if (type === "call-ended") {
-            sendTo(msg.to, { type: "call-ended", from: socketId });
-            return;
-        }
-
-        // ── Chat message ─────────────────────────────────────────────────────────
+        // ── Chat message ──────────────────────────────────────────────────────
         if (type === "chat-message") {
             const client = clients.get(socketId);
-            const payload = {
+            if (!client) return;
+            const message = String(msg.message ?? "")
+                .slice(0, 2000)
+                .trim();
+            if (!message) return;
+            broadcast(client.roomId, {
                 type: "chat-message",
                 id: uuidv4(),
                 socketId,
-                username: client?.username ?? "Unknown",
-                message: msg.message,
+                username: client.username,
+                message,
                 timestamp: new Date().toISOString(),
                 msgType: "text",
-            };
-            broadcast(msg.roomId, payload);
+            });
             return;
         }
 
-        // ── File shared ──────────────────────────────────────────────────────────
+        // ── File-shared notification ──────────────────────────────────────────
         if (type === "file-shared") {
             const client = clients.get(socketId);
-            const payload = {
+            if (!client) return;
+            broadcast(client.roomId, {
                 type: "file-shared",
                 id: uuidv4(),
                 socketId,
-                username: client?.username ?? "Unknown",
-                fileName: msg.fileName,
-                filePath: msg.filePath,
-                fileSize: msg.fileSize,
-                mimeType: msg.mimeType,
+                username: client.username,
+                fileName: String(msg.fileName ?? "").slice(0, 200),
+                filePath: String(msg.filePath ?? ""),
+                fileSize: Number(msg.fileSize ?? 0),
+                mimeType: String(msg.mimeType ?? ""),
                 timestamp: new Date().toISOString(),
                 msgType: "file",
-            };
-            broadcast(msg.roomId, payload);
+            });
             return;
         }
     });
 
-    // ── Disconnect ───────────────────────────────────────────────────────────
-    ws.on("close", () => {
-        const client = clients.get(socketId);
-        if (client) {
-            const room = rooms.get(client.roomId);
-            room?.delete(socketId);
-            if (room?.size === 0) rooms.delete(client.roomId);
-            broadcast(client.roomId, {
-                type: "user-left",
-                socketId,
-                username: client.username,
-            });
-            clients.delete(socketId);
-            console.log(`❌ Disconnected: ${client.username}`);
-        }
+    ws.on("close", () => removeClient(socketId));
+    ws.on("error", (err) => {
+        console.error(`WS error (${socketId.slice(0, 8)}):`, err.message);
+        removeClient(socketId);
     });
-
-    ws.on("error", (err) => console.error("WS error:", err.message));
 });
 
-// ── Start ────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT ?? 3000;
-server.listen(PORT, () => console.log(`🚀 Server → http://localhost:${PORT}`));
+// ── Start ─────────────────────────────────────────────────────────────────────
+server.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 PulseRTC [${IS_PROD ? "production" : "development"}] → http://0.0.0.0:${PORT}`);
+    console.log(`📁 Static: ${PUBLIC_DIR}`);
+});
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+function shutdown(signal) {
+    console.log(`\n${signal} — shutting down…`);
+    clearInterval(pingTimer);
+    wss.clients.forEach((ws) => ws.terminate());
+    server.close(() => {
+        console.log("Server closed.");
+        process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 5000);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

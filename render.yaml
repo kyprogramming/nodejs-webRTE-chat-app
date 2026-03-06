@@ -1,0 +1,31 @@
+# render.yaml — Infrastructure as Code for Render
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Deploy steps:
+#   1. Push this repo to GitHub
+#   2. Go to https://dashboard.render.com → New → Blueprint
+#   3. Connect your repo — Render reads this file automatically
+#   4. Add env vars in the Render dashboard (TURN_* if needed)
+
+services:
+- type: web
+  name: pulsertc
+  runtime: node
+  region: oregon # change to: oregon | frankfurt | singapore | ohio
+  plan: free # free | starter | standard | pro
+  buildCommand: npm install --omit=dev
+  startCommand: npm start
+  healthCheckPath: /
+  envVars:
+  - key: NODE_ENV
+    value: production
+  - key: PORT
+    value: 10000 # Render sets PORT automatically; this is a fallback
+  # Optional TURN server — add real values in Render dashboard
+  # - key: TURN_URL
+  #   sync: false         # prompts for value in dashboard (keeps secret out of git)
+  # - key: TURN_USERNAME
+  #   sync: false
+  # - key: TURN_CREDENTIAL
+  #   sync: false
+  autoDeploy: true
