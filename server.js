@@ -151,23 +151,9 @@ function getIndexHtml(cb) {
     });
 }
 
-// ── SPA catch-all ─────────────────────────────────────────────────────────────
-// Handles every GET that wasn't matched by static files or /upload
-// Uses app.use to avoid the path-to-regexp "*" breakage in Express 4.19+
-app.use((req, res, next) => {
-    // Only handle GET/HEAD — let Express deal with 405 for other methods on unknown routes
-    if (req.method !== "GET" && req.method !== "HEAD") {
-        return res.status(405).json({ error: "Method not allowed" });
-    }
-    getIndexHtml((err, html) => {
-        if (err) {
-            console.error("Failed to read index.html:", err);
-            return res.status(500).send("Internal server error");
-        }
-        res.setHeader("Content-Type", "text/html; charset=utf-8");
-        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.send(html);
-    });
+// ── Root route → index.html ───────────────────────────────────────────────────
+app.get("/", (req, res) => {
+    res.sendFile(path.join(PUBLIC_DIR, "index.html"));
 });
 
 // ── Global error handler (must be last, after all routes) ─────────────────────
